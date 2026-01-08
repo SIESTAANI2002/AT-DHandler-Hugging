@@ -4,6 +4,8 @@ import logging
 import asyncio
 import random
 from pyrogram import Client, idle, enums
+# 👇 এই লাইনটি নতুন যুক্ত করা হয়েছে (এরর ফিক্সের জন্য)
+from pyrogram.errors import FileReferenceExpired 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -51,7 +53,7 @@ async def root_route_handler(request):
         "maintainer": "AnimeToki"
     })
 
-# --- 🔥 SMART CLUSTER REQUEST PROCESSOR (With Debug Log) ---
+# --- 🔥 SMART CLUSTER REQUEST PROCESSOR (Fixed FileRef Error) ---
 async def process_request(request):
     try:
         file_id = request.match_info['file_id']
@@ -108,8 +110,22 @@ async def process_request(request):
         except Exception as e:
             logger.error(f"Debug Log Error: {e}")
 
-        # সফল ক্লায়েন্ট দিয়ে ডাউনলোড শুরু
-        return await media_streamer(request, src_msg, custom_file_name=db_file_name)
+        # ৪. সফল ক্লায়েন্ট দিয়ে ডাউনলোড শুরু (With Retry Logic) 🛠️
+        try:
+            return await media_streamer(request, src_msg, custom_file_name=db_file_name)
+        
+        except FileReferenceExpired:
+            # ⚠️ যদি রেফারেন্স এক্সপায়ার হয়, লগ করে রিফ্রেশ করব
+            logger.warning(f"⚠️ FileReferenceExpired for {db_file_name}. Refreshing...")
+            
+            try:
+                # ফোর্স রিফ্রেশ (আবার মেসেজ ফেচ করা)
+                refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
+                # আবার স্ট্রিম করার চেষ্টা
+                return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
+            except Exception as e:
+                logger.error(f"❌ Refresh Failed: {e}")
+                return web.Response(text="❌ File Refresh Failed!", status=500)
 
     except Exception as e:
         # এরর হলে লগ চ্যানেলে পাঠানো হবে
@@ -138,7 +154,7 @@ async def start_streamer():
             api_id=Config.API_ID,
             api_hash=Config.API_HASH,
             session_string=Config.SESSION_STRING,
-            plugins=dict(root="bot/plugins"), # 👈 শুধু এই লাইনটি অ্যাড করা হয়েছে
+            plugins=dict(root="bot/plugins"), # 👈 শুধু এই লাইনটি অ্যাড করা হয়েছে (MainBot Only)
             in_memory=True,
             ipv6=False,
             workers=100, 

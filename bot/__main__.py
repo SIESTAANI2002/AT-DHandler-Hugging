@@ -3,17 +3,16 @@ import sys
 import logging
 import asyncio
 import random
+from pyrogram import Client, idle, enums
+from aiohttp import web
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Root Path Fix
 sys.path.append(os.getcwd())
 
-from pyrogram import Client, idle
-from aiohttp import web
-from apscheduler.schedulers.asyncio import AsyncIOScheduler # Scheduler Import
 from bot.info import Config
 from bot.utils.database import db
 from bot.utils.stream_helper import media_streamer 
-from bot.utils.human_readable import humanbytes 
 from bot.plugins.monitor import bandwidth_monitor
 
 # Logging Setup
@@ -23,63 +22,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 🔥 AUTO RESTART FUNCTION 🔥 ---
+# --- 🔥 LOG TO CHANNEL FUNCTION ---
+async def send_log(bot, text):
+    """Log Channel এ মেসেজ পাঠানোর ফাংশন"""
+    try:
+        if Config.LOG_CHANNEL:
+            await bot.send_message(
+                chat_id=int(Config.LOG_CHANNEL),
+                text=f"<b>⚠️ Server Log:</b>\n\n{text}",
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.error(f"Failed to send log to channel: {e}")
+
+# --- AUTO RESTART ---
 async def auto_restart():
     logger.info("⏳ Scheduled Auto-Restart Triggered!")
-    # রিস্টার্ট করার আগে বাফার ক্লিন করা
-    sys.stdout.flush()
     os.execl(sys.executable, sys.executable, *sys.argv)
 
-# --- 🌐 WEB SERVER ROUTES ---
+# --- WEB SERVER ROUTES ---
 routes = web.RouteTableDef()
 
 @routes.get("/", allow_head=True)
 async def root_route_handler(request):
-    return web.json_response({"status": "Streamer Online", "node": "Oracle/VPS", "maintainer": "AnimeToki"})
+    return web.json_response({
+        "status": "Cluster System Online", 
+        "node": "Multi-Bot Farm", 
+        "maintainer": "AnimeToki"
+    })
 
-# --- 🌍 API FOR EXTERNAL WEBSITE 🌍 ---
-@routes.get("/api/file/{unique_id}")
-async def file_api_handler(request):
-    try:
-        unique_id = request.match_info['unique_id']
-        file_data = await db.get_file(unique_id)
-        
-        if not file_data:
-            return web.json_response({"error": "File not found"}, status=404, headers={"Access-Control-Allow-Origin": "*"})
-
-        file_name = file_data.get('file_name', 'Unknown File')
-        file_size_bytes = int(file_data.get('file_size', 0))
-        file_size = humanbytes(file_size_bytes)
-        
-        stream_link = f"{Config.URL}/stream/{unique_id}"
-        
-        response_data = {
-            "file_name": file_name,
-            "file_size": file_size,
-            "download_link": stream_link,
-            "stream_link": stream_link,
-        }
-        
-        return web.json_response(
-            response_data,
-            headers={
-                "Access-Control-Allow-Origin": "*", 
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type"
-            }
-        )
-    except Exception as e:
-        logger.error(f"API Error: {e}")
-        return web.json_response({"error": str(e)}, status=500, headers={"Access-Control-Allow-Origin": "*"})
-
-# --- 🔥 MAIN REQUEST PROCESSOR 🔥 ---
+# --- 🔥 SMART CLUSTER REQUEST PROCESSOR (With Debug Log) ---
 async def process_request(request):
     try:
         file_id = request.match_info['file_id']
         file_data = await db.get_file(file_id)
         
         if not file_data:
-            return web.Response(text="❌ File Not Found in Database!", status=404)
+            return web.Response(text="❌ File Not Found!", status=404)
         
         db_file_name = file_data.get('file_name')
         locations = file_data.get('locations', [])
@@ -87,29 +66,55 @@ async def process_request(request):
         if not locations and file_data.get('msg_id'):
             locations.append({'chat_id': Config.BIN_CHANNEL_1, 'message_id': file_data.get('msg_id')})
 
-        random.shuffle(locations)
-        src_msg = None
-        bot = request.app['bot']
-
-        for loc in locations:
-            chat_id = loc.get('chat_id')
-            msg_id = loc.get('message_id')
-            if not chat_id or not msg_id: continue
-            try:
-                msg = await bot.get_messages(chat_id, msg_id)
-                if msg and (msg.document or msg.video or msg.audio):
-                    src_msg = msg
-                    break 
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to fetch from {chat_id}: {e}")
-                continue
+        # ১. সব বট (Clients) লিস্ট নেওয়া
+        all_clients = request.app['all_clients']
         
-        if not src_msg:
-            return web.Response(text="❌ File Not Found in any Backup Channel!", status=410)
+        # ২. লটারি করা (Shuffle) - যাতে লোড ব্যালেন্স হয়
+        random.shuffle(all_clients) 
+        
+        src_msg = None
+        working_client = None
 
+        # ৩. একটার পর একটা বট দিয়ে ট্রাই করা (Cluster Power)
+        for client in all_clients:
+            for loc in locations:
+                chat_id = loc.get('chat_id')
+                msg_id = loc.get('message_id')
+                if not chat_id or not msg_id: continue
+                
+                try:
+                    msg = await client.get_messages(chat_id, msg_id)
+                    if msg and (msg.document or msg.video or msg.audio):
+                        src_msg = msg
+                        working_client = client
+                        break 
+                except Exception:
+                    continue
+            
+            if src_msg:
+                break # ফাইল পাওয়া গেছে
+
+        if not src_msg:
+            return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
+
+        # 🔥 DEBUG LOG: কোন সেশন থেকে ফাইল যাচ্ছে তা লগ চ্যানেলে পাঠাবে
+        try:
+            bot_name = working_client.name if working_client else "Unknown"
+            debug_text = f"🔍 **Load Balance Check:**\nServed via: `{bot_name}`\nFile: `{db_file_name}`"
+            
+            # ব্যাকগ্রাউন্ডে লগ পাঠানো (স্পিড কমবে না)
+            asyncio.create_task(send_log(request.app['bot'], debug_text))
+            logger.info(f"🟢 Served by: {bot_name}")
+        except Exception as e:
+            logger.error(f"Debug Log Error: {e}")
+
+        # সফল ক্লায়েন্ট দিয়ে ডাউনলোড শুরু
         return await media_streamer(request, src_msg, custom_file_name=db_file_name)
 
     except Exception as e:
+        # এরর হলে লগ চ্যানেলে পাঠানো হবে
+        if request.app.get('bot'):
+            await send_log(request.app['bot'], f"❌ Stream Error:\n`{str(e)}`")
         logger.error(f"Server Error: {e}")
         return web.Response(text=f"Server Error: {e}", status=500)
 
@@ -122,68 +127,83 @@ async def watch_handler(request): return await process_request(request)
 @routes.get("/dl/{file_id}")
 async def download_handler(request): return await process_request(request)
 
-# --- 🚀 BOT STARTUP LOGIC ---
+# --- 🚀 CLUSTER STARTUP LOGIC ---
 async def start_streamer():
-    bot = Client(
-        "StreamerBot",
-        api_id=Config.API_ID,
-        api_hash=Config.API_HASH,
-        bot_token=Config.BOT_TOKEN,
-        plugins={"root": "bot.plugins"}, 
-        workdir="session/",
-        in_memory=True,
-        sleep_threshold=300
-    )
+    clients = []
 
-    app = web.Application(client_max_size=30000000)
+    # ১. মেইন সেশন লোড (With Plugins ✅)
+    if Config.SESSION_STRING:
+        clients.append(Client(
+            "MainBot",
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            session_string=Config.SESSION_STRING,
+            plugins=dict(root="bot/plugins"), # 👈 শুধু এই লাইনটি অ্যাড করা হয়েছে
+            in_memory=True,
+            ipv6=False,
+            workers=100, 
+            sleep_threshold=60
+        ))
+        logger.info("✅ Main Session Loaded with Plugins!")
+
+    # ২. মাল্টি সেশন লোড (No Plugins ❌ - Just Workers)
+    multi_sessions = getattr(Config, "MULTI_SESSIONS", [])
+    
+    if multi_sessions:
+        for i, session in enumerate(multi_sessions):
+            try:
+                clients.append(Client(
+                    f"ClusterBot_{i+1}",
+                    api_id=Config.API_ID,
+                    api_hash=Config.API_HASH,
+                    session_string=session,
+                    in_memory=True,
+                    ipv6=False,
+                    workers=100,
+                    sleep_threshold=60
+                ))
+                logger.info(f"✅ Cluster Bot {i+1} Added!")
+            except Exception as e:
+                logger.error(f"❌ Failed to load Cluster Bot {i+1}: {e}")
+
+    if not clients:
+        logger.error("❌ No Bots Found! Add SESSION_STRING.")
+        return
+
+    # অ্যাপ সেটআপ
+    app = web.Application(client_max_size=None)
     app.add_routes(routes)
-    app['bot'] = bot
+    app['all_clients'] = clients
+    app['bot'] = clients[0] # মেইন বট লগিং বা আপডেটের জন্য
 
-    logger.info("🚀 Starting Streamer Bot...")
-    await bot.start()
+    # সব স্টার্ট করা
+    logger.info(f"🚀 Starting Cluster with {len(clients)} Bots...")
+    for c in clients:
+        try:
+            await c.start()
+        except Exception as e:
+            logger.error(f"❌ Boot Fail {c.name}: {e}")
+
+    # ✅ লগ চ্যানেলে স্টার্ট মেসেজ পাঠানো
+    await send_log(clients[0], f"🚀 **Cluster System Started!**\n\n🔹 Total Bots: `{len(clients)}`\n🔹 Plugins: `Enabled (MainBot)`\n🔹 Debug Log: `ON`\n🔹 URL: `{Config.URL}`")
 
     asyncio.create_task(bandwidth_monitor())
-    logger.info("📊 Bandwidth Monitor Active.")
 
-    # Restart Message Logic
-    restart_file = os.path.join(os.getcwd(), ".restartmsg")
-    if os.path.exists(restart_file):
-        try:
-            with open(restart_file, "r") as f:
-                content = f.read().split()
-                if len(content) == 2:
-                    chat_id, msg_id = map(int, content)
-                    await bot.edit_message_text(chat_id, msg_id, "✅ **Streamer Node Restarted Successfully!**")
-            os.remove(restart_file)
-        except Exception as e:
-            logger.error(f"Restart Message Error: {e}")
-
-    # --- ⏰ AUTO RESTART SCHEDULER (UPDATED) ---
     scheduler = AsyncIOScheduler()
-    # hours=8 মানে প্রতি ৮ ঘণ্টায় একবার (24/8 = 3 times a day)
-    scheduler.add_job(auto_restart, "interval", hours=8) 
+    scheduler.add_job(auto_restart, "interval", hours=4) # ৪ ঘণ্টা পর পর রিস্টার্ট
     scheduler.start()
-    logger.info("⏰ Auto-Restart Scheduled (Every 8 Hours)")
 
-    # Channel Check
-    target_channels = [Config.BIN_CHANNEL_1, Config.BIN_CHANNEL_2, Config.BIN_CHANNEL_3, Config.BIN_CHANNEL_4]
-    for ch in target_channels:
-        if ch and int(ch) != 0:
-            try:
-                await bot.get_chat(ch)
-                logger.info(f"✅ Connected to Bin Channel: {ch}")
-            except Exception as e:
-                logger.error(f"❌ Error verifying channel {ch}: {e}")
-
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, Config.BIND_ADRESS, Config.PORT)
-    await site.start()
+    await web.TCPSite(runner, Config.BIND_ADRESS, Config.PORT).start()
     
-    logger.info(f"🌐 API & Streamer running at: {Config.URL}")
+    logger.info(f"🌐 Cluster Server Running at: {Config.URL}")
     
     await idle()
-    await bot.stop()
+    
+    for c in clients: 
+        if c.is_connected:
+            await c.stop()
 
 if __name__ == "__main__":
     try:

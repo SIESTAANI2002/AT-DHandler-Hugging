@@ -99,12 +99,10 @@ async def process_request(request):
         if not src_msg:
             return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
 
-        # 🔥 DEBUG LOG: কোন সেশন থেকে ফাইল যাচ্ছে তা লগ চ্যানেলে পাঠাবে
+        # 🔥 DEBUG LOG
         try:
             bot_name = working_client.name if working_client else "Unknown"
             debug_text = f"🔍 **Load Balance Check:**\nServed via: `{bot_name}`\nFile: `{db_file_name}`"
-            
-            # ব্যাকগ্রাউন্ডে লগ পাঠানো (স্পিড কমবে না)
             asyncio.create_task(send_log(request.app['bot'], debug_text))
             logger.info(f"🟢 Served by: {bot_name}")
         except Exception as e:
@@ -121,14 +119,14 @@ async def process_request(request):
             try:
                 # ফোর্স রিফ্রেশ (আবার মেসেজ ফেচ করা)
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
+                
                 # আবার স্ট্রিম করার চেষ্টা
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
-                return web.Response(text="❌ File Refresh Failed!", status=500)
+                return web.Response(text="❌ File Refresh Failed! Try again later.", status=500)
 
     except Exception as e:
-        # এরর হলে লগ চ্যানেলে পাঠানো হবে
         if request.app.get('bot'):
             await send_log(request.app['bot'], f"❌ Stream Error:\n`{str(e)}`")
         logger.error(f"Server Error: {e}")
@@ -154,7 +152,7 @@ async def start_streamer():
             api_id=Config.API_ID,
             api_hash=Config.API_HASH,
             session_string=Config.SESSION_STRING,
-            plugins=dict(root="bot/plugins"), # 👈 শুধু এই লাইনটি অ্যাড করা হয়েছে (MainBot Only)
+            plugins=dict(root="bot/plugins"), # 👈 MainBot Plugins Enabled
             in_memory=True,
             ipv6=False,
             workers=100, 
@@ -162,7 +160,7 @@ async def start_streamer():
         ))
         logger.info("✅ Main Session Loaded with Plugins!")
 
-    # ২. মাল্টি সেশন লোড (No Plugins ❌ - Just Workers)
+    # ২. মাল্টি সেশন লোড (No Plugins ❌)
     multi_sessions = getattr(Config, "MULTI_SESSIONS", [])
     
     if multi_sessions:
@@ -190,7 +188,7 @@ async def start_streamer():
     app = web.Application(client_max_size=None)
     app.add_routes(routes)
     app['all_clients'] = clients
-    app['bot'] = clients[0] # মেইন বট লগিং বা আপডেটের জন্য
+    app['bot'] = clients[0]
 
     # সব স্টার্ট করা
     logger.info(f"🚀 Starting Cluster with {len(clients)} Bots...")
@@ -200,13 +198,12 @@ async def start_streamer():
         except Exception as e:
             logger.error(f"❌ Boot Fail {c.name}: {e}")
 
-    # ✅ লগ চ্যানেলে স্টার্ট মেসেজ পাঠানো
     await send_log(clients[0], f"🚀 **Cluster System Started!**\n\n🔹 Total Bots: `{len(clients)}`\n🔹 Plugins: `Enabled (MainBot)`\n🔹 Debug Log: `ON`\n🔹 URL: `{Config.URL}`")
 
     asyncio.create_task(bandwidth_monitor())
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(auto_restart, "interval", hours=4) # ৪ ঘণ্টা পর পর রিস্টার্ট
+    scheduler.add_job(auto_restart, "interval", hours=4)
     scheduler.start()
 
     runner = web.AppRunner(app, access_log=None)

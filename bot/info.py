@@ -12,6 +12,12 @@ class Config:
     API_ID = int(environ.get("API_ID", "123456"))
     API_HASH = environ.get("API_HASH", "abcd")
     BOT_TOKEN = environ.get("BOT_TOKEN", "") # নতুন বটের টোকেন
+    MULTI_SESSIONS = environ.get("MULTI_SESSIONS", "").split()
+
+    
+    # 🔥 Hugging Face-এর জন্য SESSION_STRING মাস্ট (Secrets এ যোগ করবেন)
+    SESSION_STRING = environ.get("SESSION_STRING", "")
+
 
     # --- 🗄️ SAME DATABASE (Main Bot এরটা দেবেন) ---
     DATABASE_URL = environ.get("DATABASE_URL", "") 

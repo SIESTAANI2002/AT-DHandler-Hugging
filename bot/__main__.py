@@ -5,6 +5,7 @@ import asyncio
 import random
 import time
 from pyrogram import Client, idle, enums
+# 👇 Error Fix Import
 from pyrogram.errors import FileReferenceExpired 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -45,9 +46,9 @@ async def send_log(bot, text):
 
 # --- 🧹 CLEANUP LOGS (RAM Saver) ---
 async def cleanup_logs():
-    """পুরানো লগ পরিষ্কার করবে"""
+    """RAM বাঁচাতে পুরানো লগ ডিলিট করে"""
     current_time = time.time()
-    # লিমিটের চেয়ে বেশি পুরোনো ডাটা ডিলিট
+    # লিমিটের চেয়ে ১ মিনিট বেশি পুরোনো হলেই ডিলিট
     expired = [k for k, v in ACCESS_LOGS.items() if current_time - v > TIME_LIMIT + 60]
     for k in expired:
         del ACCESS_LOGS[k]
@@ -64,7 +65,8 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "security": "2-Min Resume Limit", 
+        "security": "Smart Resume Blocker", 
+        "limit": f"{TIME_LIMIT} Seconds",
         "maintainer": "AnimeToki"
     })
 
@@ -73,35 +75,44 @@ async def process_request(request):
     try:
         file_id = request.match_info['file_id']
 
-        # 🛡️ RESUME BLOCKER LOGIC (IP Check) 🛡️
+        # 🛡️ SMART RESUME BLOCKER LOGIC 🛡️
         # ১. ইউজারের IP বের করা
         user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
         if "," in user_ip: 
             user_ip = user_ip.split(",")[0].strip()
 
-        # ২. ইউনিক কী (IP + FileID)
         access_key = f"{user_ip}_{file_id}"
         current_time = time.time()
 
-        # ৩. চেক করা
+        # ২. চেক করা: ইউজার কি Resume করছে?
+        range_header = request.headers.get("Range")
+        is_resume = False
+        if range_header and not range_header.strip().startswith("bytes=0-"):
+            is_resume = True
+
+        # ৩. সময় চেক করা
         if access_key in ACCESS_LOGS:
             start_time = ACCESS_LOGS[access_key]
             elapsed_time = current_time - start_time
             
-            # যদি ২ মিনিটের বেশি হয় -> ব্লক 🚫
+            # সময় শেষ হয়ে গেলে
             if elapsed_time > TIME_LIMIT:
-                return web.Response(
-                    text=f"🚫 <b>Link Expired!</b>\nYour {int(TIME_LIMIT/60)} minutes download window has passed.\nYou cannot resume this file anymore.", 
-                    status=403, 
-                    content_type='text/html'
-                )
+                if is_resume:
+                    # সময় শেষ + Resume = 🚫 BLOCK
+                    return web.Response(
+                        text=f"🚫 <b>Link Expired!</b>\nYour download window ({int(TIME_LIMIT/60)} mins) has passed.\nPlease restart the download.", 
+                        status=403, 
+                        content_type='text/html'
+                    )
+                else:
+                    # সময় শেষ + Start New = ✅ RESET & ALLOW
+                    ACCESS_LOGS[access_key] = current_time
         else:
-            # নতুন ইউজার -> টাইম রেকর্ড করলাম ✅
+            # একদম নতুন ইউজার = ✅ ALLOW
             ACCESS_LOGS[access_key] = current_time
 
         # --- DATABASE & FILE LOGIC ---
         file_data = await db.get_file(file_id)
-        
         if not file_data:
             return web.Response(text="❌ File Not Found!", status=404)
         
@@ -111,20 +122,19 @@ async def process_request(request):
         if not locations and file_data.get('msg_id'):
             locations.append({'chat_id': Config.BIN_CHANNEL_1, 'message_id': file_data.get('msg_id')})
 
-        # ১. সব বট লিস্ট
+        # ১. Load Balance
         all_clients = request.app['all_clients']
         random.shuffle(all_clients) 
         
         src_msg = None
         working_client = None
 
-        # ২. ফাইল খোঁজা
+        # ২. File Hunting
         for client in all_clients:
             for loc in locations:
                 chat_id = loc.get('chat_id')
                 msg_id = loc.get('message_id')
                 if not chat_id or not msg_id: continue
-                
                 try:
                     msg = await client.get_messages(chat_id, msg_id)
                     if msg and (msg.document or msg.video or msg.audio):
@@ -133,9 +143,7 @@ async def process_request(request):
                         break 
                 except Exception:
                     continue
-            
-            if src_msg:
-                break 
+            if src_msg: break 
 
         if not src_msg:
             return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
@@ -143,16 +151,13 @@ async def process_request(request):
         # 🔥 DEBUG LOG
         try:
             bot_name = working_client.name if working_client else "Unknown"
-            debug_text = f"🔍 **Limit Check:**\nServed via: `{bot_name}`\nIP: `{user_ip}`\nAllowed Time: `{TIME_LIMIT}s`"
-            asyncio.create_task(send_log(request.app['bot'], debug_text))
+            # asyncio.create_task(send_log(request.app['bot'], f"Served: {bot_name} | IP: {user_ip}"))
             logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip}")
-        except Exception as e:
-            logger.error(f"Debug Log Error: {e}")
+        except: pass
 
-        # ৪. সফল ক্লায়েন্ট দিয়ে ডাউনলোড শুরু (Retry Logic সহ)
+        # ৩. Streaming + Error Fix
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
-        
         except FileReferenceExpired:
             logger.warning(f"⚠️ FileReferenceExpired for {db_file_name}. Refreshing...")
             try:
@@ -160,7 +165,7 @@ async def process_request(request):
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
-                return web.Response(text="❌ File Refresh Failed! Try again later.", status=500)
+                return web.Response(text="❌ Refresh Failed!", status=500)
 
     except Exception as e:
         if request.app.get('bot'):
@@ -181,7 +186,7 @@ async def download_handler(request): return await process_request(request)
 async def start_streamer():
     clients = []
 
-    # ১. মেইন সেশন
+    # ১. Main Bot (Plugins Enabled)
     if Config.SESSION_STRING:
         clients.append(Client(
             "MainBot",
@@ -196,7 +201,7 @@ async def start_streamer():
         ))
         logger.info("✅ Main Session Loaded with Plugins!")
 
-    # ২. মাল্টি সেশন
+    # ২. Cluster Bots (Plugins Disabled)
     multi_sessions = getattr(Config, "MULTI_SESSIONS", [])
     if multi_sessions:
         for i, session in enumerate(multi_sessions):
@@ -226,19 +231,17 @@ async def start_streamer():
 
     logger.info(f"🚀 Starting Cluster with {len(clients)} Bots...")
     for c in clients:
-        try:
-            await c.start()
-        except Exception as e:
-            logger.error(f"❌ Boot Fail {c.name}: {e}")
+        try: await c.start()
+        except: pass
 
-    await send_log(clients[0], f"🚀 **System Started!**\nLimit: `2 Minutes`\nBots: `{len(clients)}`")
+    await send_log(clients[0], f"🚀 **System Started!**\nLimit: `{int(TIME_LIMIT/60)} Mins`\nBots: `{len(clients)}`")
 
     asyncio.create_task(bandwidth_monitor())
 
-    # Scheduler: Restart + Cleanup
+    # Scheduler: Restart (4h) + Cleanup (5m)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(auto_restart, "interval", hours=4)
-    scheduler.add_job(cleanup_logs, "interval", minutes=5) # প্রতি ৫ মিনিটে লগ ক্লিন করবে
+    scheduler.add_job(cleanup_logs, "interval", minutes=5)
     scheduler.start()
 
     runner = web.AppRunner(app, access_log=None)
@@ -250,8 +253,7 @@ async def start_streamer():
     await idle()
     
     for c in clients: 
-        if c.is_connected:
-            await c.stop()
+        if c.is_connected: await c.stop()
 
 if __name__ == "__main__":
     try:

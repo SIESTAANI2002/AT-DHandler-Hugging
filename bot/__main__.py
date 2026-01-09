@@ -5,7 +5,7 @@ import asyncio
 import random
 import time
 from pyrogram import Client, idle, enums
-# 👇 Error Fix Import
+# 👇 এই লাইনটি এরর ফিক্সের জন্য খুবই গুরুত্বপূর্ণ
 from pyrogram.errors import FileReferenceExpired 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -151,21 +151,24 @@ async def process_request(request):
         # 🔥 DEBUG LOG
         try:
             bot_name = working_client.name if working_client else "Unknown"
-            # asyncio.create_task(send_log(request.app['bot'], f"Served: {bot_name} | IP: {user_ip}"))
             logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip}")
         except: pass
 
-        # ৩. Streaming + Error Fix
+        # ৩. Streaming + Error Fix (RETRY LOGIC) ✅
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
+        
         except FileReferenceExpired:
+            # ⚠️ এরর ধরলে এখানে আসবে এবং রিফ্রেশ করবে
             logger.warning(f"⚠️ FileReferenceExpired for {db_file_name}. Refreshing...")
             try:
+                # Force Refresh Message (Telegram থেকে নতুন করে আনা)
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
+                # আবার স্ট্রিম করার চেষ্টা
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
-                return web.Response(text="❌ Refresh Failed!", status=500)
+                return web.Response(text="❌ Refresh Failed! Try again later.", status=500)
 
     except Exception as e:
         if request.app.get('bot'):

@@ -2,12 +2,64 @@ import math
 import logging
 from aiohttp import web
 from urllib.parse import quote 
-from bot.utils.custom_dl import ByteStreamer
-from bot.utils.file_properties import get_file_id_for_stream
+from pyrogram.types import Message
+from pyrogram.errors import FileReferenceExpired
 
+# Logging Setup
+logger = logging.getLogger(__name__)
 TG_CHUNK = 1024 * 1024  # 1MB Telegram Chunk Size
 
-# CORS Headers
+# --- 🛠️ Custom ByteStreamer Class (Fixed) ---
+class ByteStreamer:
+    def __init__(self, client, message: Message):
+        self.client = client
+        self.message = message
+        self.media = getattr(message, message.media.value)
+        self.file_id = self.media.file_id
+
+    async def yield_chunk(self, offset=0, length=-1):
+        """
+        এই জেনারেটর ফাংশনটি ফাইল ডাউনলোড করে এবং ব্রাউজারে পাঠায়।
+        এখানেই আমরা FileReferenceExpired এরর হ্যান্ডেল করব।
+        """
+        try:
+            # পাইরোগ্রামের স্মার্ট স্ট্রিমার ব্যবহার করা হচ্ছে
+            async for chunk in self.client.stream_media(
+                message=self.message,
+                offset=offset,
+                limit=length
+            ):
+                yield chunk
+
+        except FileReferenceExpired:
+            # ⚠️ যদি মাঝপথে এরর আসে, আমরা মেসেজ রিফ্রেশ করব
+            logger.warning(f"⚠️ Stream Error: FileReferenceExpired for {self.file_id}. Refreshing...")
+            
+            try:
+                # ১. মেসেজ রিফ্রেশ (Telegram থেকে নতুন রেফারেন্স আনা)
+                refresh_msg = await self.client.get_messages(
+                    chat_id=self.message.chat.id,
+                    message_ids=self.message.id
+                )
+                
+                # ২. নতুন মেসেজ অবজেক্ট আপডেট করা
+                self.message = refresh_msg
+                self.media = getattr(refresh_msg, refresh_msg.media.value)
+
+                # ৩. আবার ডাউনলোড শুরু করা (Retry)
+                async for chunk in self.client.stream_media(
+                    message=self.message,
+                    offset=offset,
+                    limit=length
+                ):
+                    yield chunk
+                    
+            except Exception as e:
+                logger.error(f"❌ Refresh Failed inside Streamer: {e}")
+                # এখানে আর কিছু করার নেই, কানেকশন ড্রপ হবে
+                raise e
+
+# --- CORS Headers ---
 def cors_headers():
     return {
         "Access-Control-Allow-Origin": "*",
@@ -16,43 +68,38 @@ def cors_headers():
         "Access-Control-Expose-Headers": "Content-Length, Content-Range",
     }
 
-async def media_streamer(request, message, custom_file_name=None):
+# --- 🔥 Main Media Streamer Function ---
+async def media_streamer(request, message: Message, custom_file_name=None):
     try:
-        media = message.video or message.document or message.audio or message.animation
+        media = getattr(message, message.media.value, None)
         if not media:
             raise web.HTTPNotFound(text="Media not found")
 
-        # ফাইল প্রপার্টিজ নেওয়া
-        file_id = await get_file_id_for_stream(media)
-        file_size = file_id.file_size
+        file_size = media.file_size
 
         # --- FILENAME LOGIC ---
         if custom_file_name:
             file_name = custom_file_name
         else:
-            file_name = getattr(media, "file_name", None)
-            if not file_name:
-                file_name = f"AnimeToki_{message.id}.mp4"
+            file_name = getattr(media, "file_name", None) or f"AnimeToki_{message.id}.mp4"
 
         encoded_file_name = quote(file_name)
         mime_type = getattr(media, "mime_type", "video/mp4") or "video/mp4"
 
-        # --- RANGE HEADER HANDLING (Resume Support) ---
+        # --- RANGE HEADER HANDLING ---
         range_header = request.headers.get("Range")
+        start = 0
+        end = file_size - 1
+        status = 200
+
         if range_header:
             try:
-                start, end = range_header.replace("bytes=", "").split("-")
-                start = int(start)
-                end = int(end) if end else file_size - 1
-                status = 206
+                parts = range_header.replace("bytes=", "").split("-")
+                start = int(parts[0]) if parts[0] else 0
+                end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+                status = 206 # Partial Content
             except ValueError:
-                start = 0
-                end = file_size - 1
-                status = 200
-        else:
-            start = 0
-            end = file_size - 1
-            status = 200
+                status = 200 # Fallback
 
         if start >= file_size:
             return web.Response(
@@ -60,44 +107,26 @@ async def media_streamer(request, message, custom_file_name=None):
                 headers={"Content-Range": f"bytes */{file_size}"}
             )
 
-        # --- OFFSET CALCULATION (FileStreamBot Magic) ---
-        # 1. টেলিগ্রামের জন্য Offset অবশ্যই 1MB এর গুণিতক হতে হবে
-        offset = start - (start % TG_CHUNK) 
-        
-        # 2. পাইরোগ্রামে পাঠানোর জন্য Chunk Index বের করা
-        chunk_index = offset // TG_CHUNK
-        
-        # 3. প্রথম চাঙ্ক থেকে কতটুকু কেটে ফেলতে হবে
-        first_part_cut = start - offset
-        
-        # 4. শেষ চাঙ্ক কোথায় থামবে
-        last_part_cut = (end % TG_CHUNK) + 1
-        
-        # 5. মোট কতগুলো চাঙ্ক নামাতে হবে
-        part_count = math.ceil(end / TG_CHUNK) - math.floor(offset / TG_CHUNK)
+        # Length Calculation
+        content_length = end - start + 1
 
-        # --- STREAMING START ---
-        bot = request.app['bot']
-        streamer = ByteStreamer(bot)
-        
-        body = streamer.yield_file(
-            media.file_id,
-            chunk_index,
-            first_part_cut,
-            last_part_cut,
-            part_count,
-        )
-
+        # --- HEADERS SETUP ---
         headers = {
             "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'attachment; filename="{file_name}"; filename*=UTF-8\'\'{encoded_file_name}',
-            "Content-Length": str(end - start + 1),
+            "Content-Length": str(content_length),
         }
         headers.update(cors_headers())
 
         if status == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+        # --- STREAMING START ---
+        # ⚠️ ক্লাস্টার ফিক্স: message._client ব্যবহার করছি যাতে সঠিক বট ডাউনলোড করে
+        streamer = ByteStreamer(client=message._client, message=message)
+        
+        body = streamer.yield_chunk(offset=start, length=content_length)
 
         return web.Response(status=status, body=body, headers=headers)
 

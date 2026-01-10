@@ -84,18 +84,26 @@ async def process_request(request):
         access_key = f"{user_ip}_{file_id}"
         current_time = time.time()
 
-        # ২. সঠিক Resume ডিটেকশন (Integer Check) ✅
-        # স্ট্রিং চেক করার বদলে আমরা দেখব বাইট 0 নাকি বেশি
+        # ২. শক্তিশালী Resume ডিটেকশন (Integer Parsing) ✅
         range_header = request.headers.get("Range")
         start_byte = 0
         
         if range_header:
             try:
-                # হেডার থেকে নাম্বার বের করা (Example: bytes=1024-2048 -> 1024)
-                parts = range_header.replace("bytes=", "").split("-")
-                if parts[0].strip().isdigit():
-                    start_byte = int(parts[0])
-            except ValueError:
+                # হেডার ক্লিন করা: "bytes=1024-2048" -> "1024-2048"
+                temp_range = range_header.replace("bytes=", "").strip()
+                
+                if "-" in temp_range:
+                    # হাইফেনের আগের অংশ নেওয়া
+                    start_part = temp_range.split("-")[0]
+                    if start_part.strip().isdigit():
+                        start_byte = int(start_part)
+                else:
+                    # যদি হাইফেন না থাকে
+                    if temp_range.isdigit():
+                        start_byte = int(temp_range)
+            except Exception as e:
+                logger.error(f"Range Parsing Error: {e}")
                 start_byte = 0
         
         # যদি 0 বাইটের বেশি থেকে শুরু করতে চায়, তার মানে Resume
@@ -110,7 +118,7 @@ async def process_request(request):
             if elapsed_time > TIME_LIMIT:
                 if is_resume:
                     # সময় শেষ + Resume (মাঝখান থেকে ডাউনলোড) = 🚫 BLOCK
-                    logger.info(f"🚫 Blocked Resume: IP={user_ip} | StartByte={start_byte}")
+                    logger.info(f"🚫 Blocked Resume: IP={user_ip} | Byte={start_byte} | TimeOver={int(elapsed_time)}s")
                     return web.Response(
                         text=f"🚫 <b>Link Expired!</b>\nYour download window ({int(TIME_LIMIT/60)} mins) has passed.\nPlease restart the download from beginning.", 
                         status=403, 
@@ -118,7 +126,7 @@ async def process_request(request):
                     )
                 else:
                     # সময় শেষ + Start New (শুরু থেকে) = ✅ RESET & ALLOW
-                    # logger.info(f"🔄 Timer Reset: IP={user_ip} | New Start")
+                    logger.info(f"🔄 Timer Reset (New Start): IP={user_ip}")
                     ACCESS_LOGS[access_key] = current_time
         else:
             # একদম নতুন ইউজার = ✅ ALLOW
@@ -142,7 +150,6 @@ async def process_request(request):
         src_msg = None
         working_client = None
 
-        # ২. File Hunting
         for client in all_clients:
             for loc in locations:
                 chat_id = loc.get('chat_id')
@@ -164,7 +171,7 @@ async def process_request(request):
         # 🔥 DEBUG LOG
         try:
             bot_name = working_client.name if working_client else "Unknown"
-            logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip} | Resume: {is_resume}")
+            # logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip} | Resume: {is_resume}")
         except: pass
 
         # ৩. Streaming + Error Fix (RETRY LOGIC) ✅

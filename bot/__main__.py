@@ -92,7 +92,7 @@ async def process_request(request):
         if not src_msg:
             return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
 
-        # ⚠️ NOTE: Access Log removed here as per request.
+        # ❌ Download Started Log REMOVED here.
 
         # 4. Streaming (With Error Fix)
         try:
@@ -105,13 +105,13 @@ async def process_request(request):
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
-                # এরর হলে লগে পাঠাবে
+                # শুধু এরর হলে লগে পাঠাবে
                 if request.app.get('bot'):
                     asyncio.create_task(send_log(request.app['bot'], f"❌ **Refresh Failed:**\n`{db_file_name}`\nError: `{e}`"))
                 return web.Response(text="❌ Refresh Failed! Try again later.", status=500)
 
     except Exception as e:
-        # 📢 SEND ERROR LOG (ONLY ERRORS)
+        # 📢 SEND ERROR LOG (ONLY IF SERVER ERROR)
         if request.app.get('bot'):
             asyncio.create_task(send_log(request.app['bot'], f"❌ **Stream Error:**\n`{str(e)}`"))
             
@@ -179,7 +179,7 @@ async def start_streamer():
         try: await c.start()
         except: pass
 
-    # 📢 SEND STARTUP LOG (ONLY ONCE)
+    # 📢 SEND STARTUP LOG (System Ready Message)
     await send_log(clients[0], f"🚀 **System Started!**\nMode: `Quiet High Speed`\nBots: `{len(clients)}`")
 
     # Bandwidth Monitor & Auto Restart

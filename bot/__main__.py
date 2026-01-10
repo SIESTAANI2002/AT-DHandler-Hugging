@@ -23,6 +23,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- 🛠️ HELPER: File Size Formatter (API এর জন্য দরকার) ---
+def humanbytes(size):
+    if not size: return ""
+    power = 2**10
+    n = 0
+    dic_powerN = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
+    while size > power:
+        size /= power
+        n += 1
+    return str(round(size, 2)) + " " + dic_powerN[n] + 'B'
+
 # --- 🔥 LOG FUNCTION ---
 async def send_log(bot, text):
     try:
@@ -47,34 +58,75 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "mode": "Quiet High Speed", 
+        "mode": "API + Quiet High Speed", 
         "maintainer": "AnimeToki"
     })
 
-# --- 🔥 REQUEST PROCESSOR ---
+# --- 🟡 API ROUTE (Frontend এর জন্য JSON Data) ---
+@routes.get("/api/file/{file_id}")
+async def api_file_handler(request):
+    try:
+        file_id = request.match_info['file_id']
+        file_data = await db.get_file(file_id)
+        
+        if not file_data:
+            return web.json_response(
+                {"error": True, "message": "Not Found"}, 
+                headers={"Access-Control-Allow-Origin": "*"}
+            )
+        
+        f_name = file_data.get('file_name', 'Unknown File')
+        f_size = "Unknown"
+        
+        # সাইজ ফরম্যাট করা
+        if file_data.get('file_size'):
+             f_size = humanbytes(int(file_data.get('file_size')))
+        
+        # JSON রেসপন্স
+        return web.json_response({
+            "error": False,
+            "file_name": f_name,
+            "file_size": f_size
+        }, headers={"Access-Control-Allow-Origin": "*"}) # CORS Header
+        
+    except Exception as e:
+        return web.json_response(
+            {"error": True, "message": str(e)}, 
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+
+# --- 🔥 REQUEST PROCESSOR (Streaming) ---
 async def process_request(request):
     try:
         file_id = request.match_info['file_id']
         
-        # 1. Get File from Database
+        # 🔥 ১. URL থেকে কাস্টম নাম চেক করা (Frontend থেকে আসলে)
+        custom_name = request.query.get('name')
+
+        # 2. Get File from Database
         file_data = await db.get_file(file_id)
         if not file_data:
             return web.Response(text="❌ File Not Found!", status=404)
         
-        db_file_name = file_data.get('file_name')
+        # 🔥 নাম সেট করা: যদি URL-এ নাম থাকে, সেটা ব্যবহার হবে
+        if custom_name:
+            db_file_name = custom_name
+        else:
+            db_file_name = file_data.get('file_name')
+
         locations = file_data.get('locations', [])
         
         if not locations and file_data.get('msg_id'):
             locations.append({'chat_id': Config.BIN_CHANNEL_1, 'message_id': file_data.get('msg_id')})
 
-        # 2. Cluster Load Balancing
+        # 3. Cluster Load Balancing
         all_clients = request.app['all_clients']
         random.shuffle(all_clients) 
         
         src_msg = None
         working_client = None
 
-        # 3. File Hunting
+        # 4. File Hunting
         for client in all_clients:
             for loc in locations:
                 chat_id = loc.get('chat_id')
@@ -92,9 +144,9 @@ async def process_request(request):
         if not src_msg:
             return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
 
-        # ❌ Download Started Log REMOVED here.
+        # ❌ Access Log Removed (Quiet Mode)
 
-        # 4. Streaming (With Error Fix)
+        # 5. Streaming (With Error Fix)
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
         
@@ -105,7 +157,7 @@ async def process_request(request):
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
-                # শুধু এরর হলে লগে পাঠাবে
+                # শুধু রিফ্রেশ এরর হলে লগে পাঠাবে
                 if request.app.get('bot'):
                     asyncio.create_task(send_log(request.app['bot'], f"❌ **Refresh Failed:**\n`{db_file_name}`\nError: `{e}`"))
                 return web.Response(text="❌ Refresh Failed! Try again later.", status=500)
@@ -180,7 +232,7 @@ async def start_streamer():
         except: pass
 
     # 📢 SEND STARTUP LOG (System Ready Message)
-    await send_log(clients[0], f"🚀 **System Started!**\nMode: `Quiet High Speed`\nBots: `{len(clients)}`")
+    await send_log(clients[0], f"🚀 **System Started!**\nMode: `API + Quiet Speed`\nBots: `{len(clients)}`")
 
     # Bandwidth Monitor & Auto Restart
     asyncio.create_task(bandwidth_monitor())

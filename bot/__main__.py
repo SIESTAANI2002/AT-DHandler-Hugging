@@ -5,7 +5,7 @@ import asyncio
 import random
 import time
 from pyrogram import Client, idle, enums
-# 👇 এই লাইনটি এরর ফিক্সের জন্য খুবই গুরুত্বপূর্ণ
+# 👇 Error Fix Import
 from pyrogram.errors import FileReferenceExpired 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -75,7 +75,7 @@ async def process_request(request):
     try:
         file_id = request.match_info['file_id']
 
-        # 🛡️ SMART RESUME BLOCKER LOGIC 🛡️
+        # 🛡️ SMART RESUME BLOCKER LOGIC (ROBUST VERSION) 🛡️
         # ১. ইউজারের IP বের করা
         user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
         if "," in user_ip: 
@@ -84,28 +84,41 @@ async def process_request(request):
         access_key = f"{user_ip}_{file_id}"
         current_time = time.time()
 
-        # ২. চেক করা: ইউজার কি Resume করছে?
+        # ২. সঠিক Resume ডিটেকশন (Integer Check) ✅
+        # স্ট্রিং চেক করার বদলে আমরা দেখব বাইট 0 নাকি বেশি
         range_header = request.headers.get("Range")
-        is_resume = False
-        if range_header and not range_header.strip().startswith("bytes=0-"):
-            is_resume = True
+        start_byte = 0
+        
+        if range_header:
+            try:
+                # হেডার থেকে নাম্বার বের করা (Example: bytes=1024-2048 -> 1024)
+                parts = range_header.replace("bytes=", "").split("-")
+                if parts[0].strip().isdigit():
+                    start_byte = int(parts[0])
+            except ValueError:
+                start_byte = 0
+        
+        # যদি 0 বাইটের বেশি থেকে শুরু করতে চায়, তার মানে Resume
+        is_resume = start_byte > 0
 
         # ৩. সময় চেক করা
         if access_key in ACCESS_LOGS:
             start_time = ACCESS_LOGS[access_key]
             elapsed_time = current_time - start_time
             
-            # সময় শেষ হয়ে গেলে
+            # যদি সময় শেষ হয়ে যায় (২ মিনিট বা যা সেট করেছেন)
             if elapsed_time > TIME_LIMIT:
                 if is_resume:
-                    # সময় শেষ + Resume = 🚫 BLOCK
+                    # সময় শেষ + Resume (মাঝখান থেকে ডাউনলোড) = 🚫 BLOCK
+                    logger.info(f"🚫 Blocked Resume: IP={user_ip} | StartByte={start_byte}")
                     return web.Response(
-                        text=f"🚫 <b>Link Expired!</b>\nYour download window ({int(TIME_LIMIT/60)} mins) has passed.\nPlease restart the download.", 
+                        text=f"🚫 <b>Link Expired!</b>\nYour download window ({int(TIME_LIMIT/60)} mins) has passed.\nPlease restart the download from beginning.", 
                         status=403, 
                         content_type='text/html'
                     )
                 else:
-                    # সময় শেষ + Start New = ✅ RESET & ALLOW
+                    # সময় শেষ + Start New (শুরু থেকে) = ✅ RESET & ALLOW
+                    # logger.info(f"🔄 Timer Reset: IP={user_ip} | New Start")
                     ACCESS_LOGS[access_key] = current_time
         else:
             # একদম নতুন ইউজার = ✅ ALLOW
@@ -151,7 +164,7 @@ async def process_request(request):
         # 🔥 DEBUG LOG
         try:
             bot_name = working_client.name if working_client else "Unknown"
-            logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip}")
+            logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip} | Resume: {is_resume}")
         except: pass
 
         # ৩. Streaming + Error Fix (RETRY LOGIC) ✅
@@ -160,7 +173,7 @@ async def process_request(request):
         
         except FileReferenceExpired:
             # ⚠️ এরর ধরলে এখানে আসবে এবং রিফ্রেশ করবে
-            logger.warning(f"⚠️ FileReferenceExpired for {db_file_name}. Refreshing...")
+            logger.warning(f"⚠️ FileRef Expired inside Main. Refreshing...")
             try:
                 # Force Refresh Message (Telegram থেকে নতুন করে আনা)
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)

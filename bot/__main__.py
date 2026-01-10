@@ -23,7 +23,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- AUTO RESTART (Optional: 4 Hours) ---
+# --- 🔥 LOG FUNCTION ---
+async def send_log(bot, text):
+    try:
+        if Config.LOG_CHANNEL:
+            await bot.send_message(
+                chat_id=int(Config.LOG_CHANNEL),
+                text=f"<b>⚠️ Server Log:</b>\n\n{text}",
+                disable_web_page_preview=True
+            )
+    except Exception as e:
+        logger.warning(f"Log Error: {e}")
+
+# --- AUTO RESTART ---
 async def auto_restart():
     logger.info("⏳ Scheduled Auto-Restart Triggered!")
     os.execl(sys.executable, sys.executable, *sys.argv)
@@ -35,19 +47,15 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "mode": "No-Limit High Speed", 
+        "mode": "Quiet High Speed", 
         "maintainer": "AnimeToki"
     })
 
-# --- 🔥 REQUEST PROCESSOR (CLEAN VERSION) ---
+# --- 🔥 REQUEST PROCESSOR ---
 async def process_request(request):
     try:
         file_id = request.match_info['file_id']
         
-        # User IP Log (Just for info, NO BLOCKING)
-        user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
-        if "," in user_ip: user_ip = user_ip.split(",")[0].strip()
-
         # 1. Get File from Database
         file_data = await db.get_file(file_id)
         if not file_data:
@@ -84,21 +92,29 @@ async def process_request(request):
         if not src_msg:
             return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
 
+        # ⚠️ NOTE: Access Log removed here as per request.
+
         # 4. Streaming (With Error Fix)
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
         
         except FileReferenceExpired:
-            # যদি লিংক এক্সপায়ার হয়, নতুন করে জেনারেট করবে
-            logger.warning(f"⚠️ FileReferenceExpired for {db_file_name}. Refreshing...")
+            logger.warning(f"⚠️ FileRef Expired. Refreshing...")
             try:
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
+                # এরর হলে লগে পাঠাবে
+                if request.app.get('bot'):
+                    asyncio.create_task(send_log(request.app['bot'], f"❌ **Refresh Failed:**\n`{db_file_name}`\nError: `{e}`"))
                 return web.Response(text="❌ Refresh Failed! Try again later.", status=500)
 
     except Exception as e:
+        # 📢 SEND ERROR LOG (ONLY ERRORS)
+        if request.app.get('bot'):
+            asyncio.create_task(send_log(request.app['bot'], f"❌ **Stream Error:**\n`{str(e)}`"))
+            
         logger.error(f"Server Error: {e}")
         return web.Response(text=f"Server Error: {e}", status=500)
 
@@ -162,6 +178,9 @@ async def start_streamer():
     for c in clients:
         try: await c.start()
         except: pass
+
+    # 📢 SEND STARTUP LOG (ONLY ONCE)
+    await send_log(clients[0], f"🚀 **System Started!**\nMode: `Quiet High Speed`\nBots: `{len(clients)}`")
 
     # Bandwidth Monitor & Auto Restart
     asyncio.create_task(bandwidth_monitor())

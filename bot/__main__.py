@@ -3,8 +3,7 @@ import sys
 import logging
 import asyncio
 import random
-import time
-from pyrogram import Client, idle, enums
+from pyrogram import Client, idle
 from pyrogram.errors import FileReferenceExpired 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,37 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 🕒 ACCESS TRACKING ---
-ACCESS_LOGS = {}
-
-# ⚡ DOWNLOAD WINDOW: এই সময়ের পর লিংক আর কাজ করবে না
-TIME_LIMIT = 120  # 2 Minutes
-
-# ⏳ COOLDOWN: টাইম লিমিট শেষ হওয়ার পর কতক্ষণ ব্লক থাকবে (Restart করার জন্য)
-# অর্থাৎ, ২ মিনিট শেষ হওয়ার পর আরও ১ মিনিট ব্লক থাকবে। তারপর নতুন করে শুরু করা যাবে।
-COOLDOWN_TIME = 60 # 1 Minute
-
-# --- 🔥 LOG TO CHANNEL ---
-async def send_log(bot, text):
-    try:
-        if Config.LOG_CHANNEL:
-            await bot.send_message(
-                chat_id=int(Config.LOG_CHANNEL),
-                text=f"<b>⚠️ Server Log:</b>\n\n{text}",
-                disable_web_page_preview=True
-            )
-    except Exception: pass
-
-# --- 🧹 CLEANUP LOGS ---
-async def cleanup_logs():
-    """পুরনো লগ মুছে দিয়ে নতুন ডাউনলোডের সুযোগ দেয়"""
-    current_time = time.time()
-    # TIME_LIMIT + COOLDOWN_TIME পার হলেই কেবল লগ মুছবে
-    expired = [k for k, v in ACCESS_LOGS.items() if current_time - v > (TIME_LIMIT + COOLDOWN_TIME)]
-    for k in expired:
-        del ACCESS_LOGS[k]
-
-# --- AUTO RESTART ---
+# --- AUTO RESTART (Optional: 4 Hours) ---
 async def auto_restart():
     logger.info("⏳ Scheduled Auto-Restart Triggered!")
     os.execl(sys.executable, sys.executable, *sys.argv)
@@ -66,54 +35,23 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "security": "Strict Anti-Bypass", 
-        "limit": f"{TIME_LIMIT} Seconds",
+        "mode": "No-Limit High Speed", 
         "maintainer": "AnimeToki"
     })
 
-# --- 🔥 SMART CLUSTER REQUEST PROCESSOR ---
+# --- 🔥 REQUEST PROCESSOR (CLEAN VERSION) ---
 async def process_request(request):
     try:
         file_id = request.match_info['file_id']
-
-        # 🛡️ STRICT ANTI-BYPASS LOGIC 🛡️
+        
+        # User IP Log (Just for info, NO BLOCKING)
         user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
         if "," in user_ip: user_ip = user_ip.split(",")[0].strip()
 
-        access_key = f"{user_ip}_{file_id}"
-        current_time = time.time()
-
-        # ১. লজিক চেক (No Reset Policy)
-        if access_key in ACCESS_LOGS:
-            start_time = ACCESS_LOGS[access_key]
-            elapsed_time = current_time - start_time
-            
-            # --- যদি সময় শেষ হয়ে যায় ---
-            if elapsed_time > TIME_LIMIT:
-                # 🚫 STRICT BLOCK: Resume বা Start যাই হোক, ব্লক!
-                # আমরা টাইমার রিসেট করছি না, তাই IDM বাইপাস করতে পারবে না।
-                
-                wait_time = (TIME_LIMIT + COOLDOWN_TIME) - elapsed_time
-                wait_msg = f"Please wait {int(wait_time)}s to start fresh." if wait_time > 0 else "Try again now."
-
-                logger.info(f"🚫 Blocked (Expired): IP={user_ip} | Elapsed={int(elapsed_time)}s")
-                return web.Response(
-                    text=f"🚫 <b>Link Expired!</b>\nYour download session of {int(TIME_LIMIT/60)} mins is over.<br>You cannot resume.<br><br>To download again from start: <b>{wait_msg}</b>", 
-                    status=403, 
-                    content_type='text/html'
-                )
-            
-            # সময় বাকি থাকলে ডাউনলোড চলবে...
-        
-        else:
-            # --- নতুন সেশন শুরু ---
-            # নতুন ইউজার, তাই টাইমার চালু করলাম
-            ACCESS_LOGS[access_key] = current_time
-            # logger.info(f"✅ New Session: IP={user_ip}")
-
-        # --- DATABASE & FILE LOGIC ---
+        # 1. Get File from Database
         file_data = await db.get_file(file_id)
-        if not file_data: return web.Response(text="❌ File Not Found!", status=404)
+        if not file_data:
+            return web.Response(text="❌ File Not Found!", status=404)
         
         db_file_name = file_data.get('file_name')
         locations = file_data.get('locations', [])
@@ -121,12 +59,14 @@ async def process_request(request):
         if not locations and file_data.get('msg_id'):
             locations.append({'chat_id': Config.BIN_CHANNEL_1, 'message_id': file_data.get('msg_id')})
 
+        # 2. Cluster Load Balancing
         all_clients = request.app['all_clients']
         random.shuffle(all_clients) 
         
         src_msg = None
         working_client = None
 
+        # 3. File Hunting
         for client in all_clients:
             for loc in locations:
                 chat_id = loc.get('chat_id')
@@ -141,23 +81,22 @@ async def process_request(request):
                 except: continue
             if src_msg: break 
 
-        if not src_msg: return web.Response(text="❌ File Not Found!", status=410)
+        if not src_msg:
+            return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
 
-        try:
-            bot_name = working_client.name if working_client else "Unknown"
-        except: pass
-
-        # Streaming
+        # 4. Streaming (With Error Fix)
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
+        
         except FileReferenceExpired:
-            logger.warning(f"⚠️ FileRef Expired. Refreshing...")
+            # যদি লিংক এক্সপায়ার হয়, নতুন করে জেনারেট করবে
+            logger.warning(f"⚠️ FileReferenceExpired for {db_file_name}. Refreshing...")
             try:
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
-                return web.Response(text="❌ Refresh Failed!", status=500)
+                return web.Response(text="❌ Refresh Failed! Try again later.", status=500)
 
     except Exception as e:
         logger.error(f"Server Error: {e}")
@@ -172,10 +111,11 @@ async def watch_handler(request): return await process_request(request)
 @routes.get("/dl/{file_id}")
 async def download_handler(request): return await process_request(request)
 
-# --- 🚀 STARTUP LOGIC ---
+# --- 🚀 CLUSTER STARTUP LOGIC ---
 async def start_streamer():
     clients = []
 
+    # Main Bot
     if Config.SESSION_STRING:
         clients.append(Client(
             "MainBot",
@@ -190,6 +130,7 @@ async def start_streamer():
         ))
         logger.info("✅ Main Session Loaded!")
 
+    # Cluster Bots
     multi_sessions = getattr(Config, "MULTI_SESSIONS", [])
     if multi_sessions:
         for i, session in enumerate(multi_sessions):
@@ -205,10 +146,11 @@ async def start_streamer():
                     sleep_threshold=60
                 ))
                 logger.info(f"✅ Cluster Bot {i+1} Added!")
-            except: pass
+            except Exception as e:
+                logger.error(f"❌ Failed to load Cluster Bot {i+1}: {e}")
 
     if not clients:
-        logger.error("❌ No Bots Found!")
+        logger.error("❌ No Bots Found! Add SESSION_STRING.")
         return
 
     app = web.Application(client_max_size=None)
@@ -216,31 +158,30 @@ async def start_streamer():
     app['all_clients'] = clients
     app['bot'] = clients[0]
 
-    logger.info(f"🚀 Starting Cluster...")
+    logger.info(f"🚀 Starting Cluster with {len(clients)} Bots...")
     for c in clients:
         try: await c.start()
         except: pass
 
-    await send_log(clients[0], f"🚀 **System Started!**\nTime Limit: {int(TIME_LIMIT/60)} Mins")
-
+    # Bandwidth Monitor & Auto Restart
     asyncio.create_task(bandwidth_monitor())
-
     scheduler = AsyncIOScheduler()
     scheduler.add_job(auto_restart, "interval", hours=4)
-    # Cleanup runs faster to allow new downloads after cooldown
-    scheduler.add_job(cleanup_logs, "interval", seconds=30) 
     scheduler.start()
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, Config.BIND_ADRESS, Config.PORT).start()
     
-    logger.info(f"🌐 Running: {Config.URL}")
+    logger.info(f"🌐 Server Running at: {Config.URL}")
+    
     await idle()
+    
     for c in clients: 
         if c.is_connected: await c.stop()
 
 if __name__ == "__main__":
     try:
         asyncio.run(start_streamer())
-    except KeyboardInterrupt: pass
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopped by User")

@@ -5,7 +5,6 @@ import asyncio
 import random
 import time
 from pyrogram import Client, idle, enums
-# 👇 Error Fix Import
 from pyrogram.errors import FileReferenceExpired 
 from aiohttp import web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,14 +24,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 🕒 ACCESS TRACKING (IP LOGS) ---
+# --- 🕒 ACCESS TRACKING ---
 ACCESS_LOGS = {}
 
-# ⚡ TESTING TIME LIMIT: 2 Minutes (120 Seconds)
-# পরে এটি বাড়িয়ে ৬ ঘণ্টা (21600) করে দেবেন
-TIME_LIMIT = 120 
+# ⚡ VALIDITY TIME: ২ মিনিট (টেস্টিং)
+TIME_LIMIT = 120  
 
-# --- 🔥 LOG TO CHANNEL FUNCTION ---
+# 🧹 MEMORY TIME: ১ ঘণ্টা (যাতে সার্ভার ভুলে না যায়)
+BLOCK_MEMORY = 3600 
+
+# --- 🔥 LOG TO CHANNEL ---
 async def send_log(bot, text):
     try:
         if Config.LOG_CHANNEL:
@@ -41,15 +42,14 @@ async def send_log(bot, text):
                 text=f"<b>⚠️ Server Log:</b>\n\n{text}",
                 disable_web_page_preview=True
             )
-    except Exception:
-        pass
+    except Exception: pass
 
-# --- 🧹 CLEANUP LOGS (RAM Saver) ---
+# --- 🧹 CLEANUP LOGS (Background Task) ---
 async def cleanup_logs():
-    """RAM বাঁচাতে পুরানো লগ ডিলিট করে"""
+    """শুধুমাত্র ১ ঘণ্টার বেশি পুরনো লগ মুছবে"""
     current_time = time.time()
-    # লিমিটের চেয়ে ১ মিনিট বেশি পুরোনো হলেই ডিলিট
-    expired = [k for k, v in ACCESS_LOGS.items() if current_time - v > TIME_LIMIT + 60]
+    # ⚠️ TIME_LIMIT দিয়ে মুছব না, BLOCK_MEMORY দিয়ে মুছব
+    expired = [k for k, v in ACCESS_LOGS.items() if current_time - v > BLOCK_MEMORY]
     for k in expired:
         del ACCESS_LOGS[k]
 
@@ -65,7 +65,7 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "security": "Session Kill Mode", 
+        "security": "Permanent Session Check", 
         "limit": f"{TIME_LIMIT} Seconds",
         "maintainer": "AnimeToki"
     })
@@ -75,65 +75,56 @@ async def process_request(request):
     try:
         file_id = request.match_info['file_id']
 
-        # 🛡️ STRICT SESSION KILL LOGIC 🛡️
+        # 🛡️ STRICT RESUME LOGIC 🛡️
         user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
-        if "," in user_ip: 
-            user_ip = user_ip.split(",")[0].strip()
+        if "," in user_ip: user_ip = user_ip.split(",")[0].strip()
 
         access_key = f"{user_ip}_{file_id}"
         current_time = time.time()
 
-        # ১. Resume ডিটেকশন
+        # ১. Resume Check (Range Header)
         range_header = request.headers.get("Range")
         start_byte = 0
         if range_header:
             try:
                 temp = range_header.replace("bytes=", "").split("-")[0]
-                if temp.strip().isdigit():
-                    start_byte = int(temp)
-            except:
-                start_byte = 0
+                if temp.strip().isdigit(): start_byte = int(temp)
+            except: pass
         
         is_resume = start_byte > 0
 
-        # ২. লজিক চেক (Hard Expiry Check)
+        # ২. লজিক চেক
         if access_key in ACCESS_LOGS:
             start_time = ACCESS_LOGS[access_key]
             elapsed_time = current_time - start_time
             
-            # --- সময় শেষ হলে সেশন ডিলিট এবং ব্লক ---
+            # --- যদি সময় শেষ হয়ে যায় ---
             if elapsed_time > TIME_LIMIT:
-                # সেশন ডিলিট করে দিচ্ছি যাতে রিসেট না হয়
-                del ACCESS_LOGS[access_key]
-                
-                logger.info(f"🚫 Session Killed (Expired): IP={user_ip} | Elapsed={int(elapsed_time)}s")
-                return web.Response(
-                    text=f"🚫 <b>Link Expired!</b>\nYour session ended {int(elapsed_time - TIME_LIMIT)}s ago.<br>Please <b>Restart</b> the download from the beginning.", 
-                    status=403, 
-                    content_type='text/html'
-                )
-            
-            # সময় বাকি আছে? তাহলে চলতে থাকুক
-            
+                if is_resume:
+                    # ⛔ Resume Blocked (লগ ডিলিট করব না, রেখে দেব)
+                    logger.info(f"🚫 Resume Blocked: IP={user_ip} | Byte={start_byte}")
+                    return web.Response(
+                        text=f"🚫 <b>Link Expired!</b>\nYour time limit is over.<br>You cannot resume.", 
+                        status=403, 
+                        content_type='text/html'
+                    )
+                else:
+                    # 🔄 New Start = Timer Reset
+                    logger.info(f"🔄 Timer Reset (Restart): IP={user_ip}")
+                    ACCESS_LOGS[access_key] = current_time
+        
         else:
-            # --- যদি লগ না থাকে (New User or Deleted Session) ---
+            # --- নতুন ইউজার ---
             if is_resume:
-                # লগ নেই কিন্তু Resume? -> অবশ্যই ব্লক।
-                logger.info(f"🚫 Blocked Invalid Resume: IP={user_ip} | Byte={start_byte}")
-                return web.Response(
-                    text="🚫 <b>Access Denied!</b>\nSession expired. You cannot resume.<br>Please start the download from the beginning.", 
-                    status=403, 
-                    content_type='text/html'
-                )
-            else:
-                # লগ নেই এবং নতুন Start -> নতুন সেশন তৈরি
-                # logger.info(f"✅ New Session Created: IP={user_ip}")
-                ACCESS_LOGS[access_key] = current_time
+                # লগ নেই কিন্তু রিজিউম? ব্লক।
+                return web.Response(status=403, text="Invalid Session")
+            
+            # নতুন এন্ট্রি
+            ACCESS_LOGS[access_key] = current_time
 
         # --- DATABASE & FILE LOGIC ---
         file_data = await db.get_file(file_id)
-        if not file_data:
-            return web.Response(text="❌ File Not Found!", status=404)
+        if not file_data: return web.Response(text="❌ File Not Found!", status=404)
         
         db_file_name = file_data.get('file_name')
         locations = file_data.get('locations', [])
@@ -141,7 +132,6 @@ async def process_request(request):
         if not locations and file_data.get('msg_id'):
             locations.append({'chat_id': Config.BIN_CHANNEL_1, 'message_id': file_data.get('msg_id')})
 
-        # Load Balance
         all_clients = request.app['all_clients']
         random.shuffle(all_clients) 
         
@@ -162,19 +152,13 @@ async def process_request(request):
                 except: continue
             if src_msg: break 
 
-        if not src_msg:
-            return web.Response(text="❌ File Not Found! (Check Bot Admins)", status=410)
-
-        # Debug Log
-        try:
-            bot_name = working_client.name if working_client else "Unknown"
-        except: pass
+        if not src_msg: return web.Response(text="❌ File Not Found!", status=410)
 
         # Streaming
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
         except FileReferenceExpired:
-            logger.warning(f"⚠️ FileRef Expired inside Main. Refreshing...")
+            logger.warning(f"⚠️ FileRef Expired. Refreshing...")
             try:
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
                 return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
@@ -183,8 +167,6 @@ async def process_request(request):
                 return web.Response(text="❌ Refresh Failed!", status=500)
 
     except Exception as e:
-        if request.app.get('bot'):
-            await send_log(request.app['bot'], f"❌ Stream Error:\n`{str(e)}`")
         logger.error(f"Server Error: {e}")
         return web.Response(text=f"Server Error: {e}", status=500)
 
@@ -197,11 +179,10 @@ async def watch_handler(request): return await process_request(request)
 @routes.get("/dl/{file_id}")
 async def download_handler(request): return await process_request(request)
 
-# --- 🚀 CLUSTER STARTUP LOGIC ---
+# --- 🚀 STARTUP LOGIC ---
 async def start_streamer():
     clients = []
 
-    # ১. Main Bot
     if Config.SESSION_STRING:
         clients.append(Client(
             "MainBot",
@@ -216,7 +197,6 @@ async def start_streamer():
         ))
         logger.info("✅ Main Session Loaded!")
 
-    # ২. Cluster Bots
     multi_sessions = getattr(Config, "MULTI_SESSIONS", [])
     if multi_sessions:
         for i, session in enumerate(multi_sessions):
@@ -232,11 +212,10 @@ async def start_streamer():
                     sleep_threshold=60
                 ))
                 logger.info(f"✅ Cluster Bot {i+1} Added!")
-            except Exception as e:
-                logger.error(f"❌ Failed to load Cluster Bot {i+1}: {e}")
+            except: pass
 
     if not clients:
-        logger.error("❌ No Bots Found! Add SESSION_STRING.")
+        logger.error("❌ No Bots Found!")
         return
 
     app = web.Application(client_max_size=None)
@@ -244,34 +223,31 @@ async def start_streamer():
     app['all_clients'] = clients
     app['bot'] = clients[0]
 
-    logger.info(f"🚀 Starting Cluster with {len(clients)} Bots...")
+    logger.info(f"🚀 Starting Cluster...")
     for c in clients:
         try: await c.start()
         except: pass
 
-    await send_log(clients[0], f"🚀 **System Started!**\nLimit: `{int(TIME_LIMIT/60)} Mins`\nBots: `{len(clients)}`")
+    await send_log(clients[0], f"🚀 **System Started!**\nTime Limit: {int(TIME_LIMIT/60)} Mins")
 
     asyncio.create_task(bandwidth_monitor())
 
-    # Scheduler: Restart (4h) + Cleanup (5m)
     scheduler = AsyncIOScheduler()
     scheduler.add_job(auto_restart, "interval", hours=4)
-    scheduler.add_job(cleanup_logs, "interval", minutes=5)
+    # ⚠️ Cleanup now runs every 30 mins to keep logs longer
+    scheduler.add_job(cleanup_logs, "interval", minutes=30) 
     scheduler.start()
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, Config.BIND_ADRESS, Config.PORT).start()
     
-    logger.info(f"🌐 Cluster Server Running at: {Config.URL}")
-    
+    logger.info(f"🌐 Running: {Config.URL}")
     await idle()
-    
     for c in clients: 
         if c.is_connected: await c.stop()
 
 if __name__ == "__main__":
     try:
         asyncio.run(start_streamer())
-    except KeyboardInterrupt:
-        logger.info("🛑 Stopped by User")
+    except KeyboardInterrupt: pass

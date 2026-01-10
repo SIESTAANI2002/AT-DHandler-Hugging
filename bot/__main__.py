@@ -27,11 +27,13 @@ logger = logging.getLogger(__name__)
 # --- 🕒 ACCESS TRACKING ---
 ACCESS_LOGS = {}
 
-# ⚡ VALIDITY TIME: ২ মিনিট (টেস্টিং)
+# ⚡ VALIDITY: ২ মিনিট ডাউনলোড উইন্ডো
 TIME_LIMIT = 120  
 
-# 🧹 MEMORY TIME: ১ ঘণ্টা (যাতে সার্ভার ভুলে না যায়)
-BLOCK_MEMORY = 3600 
+# 🔒 SESSION TIMEOUT: ১০ মিনিট
+# ২ মিনিট শেষ হওয়ার পর, আরও ৮ মিনিট ইউজার পুরোপুরি ব্লক থাকবে।
+# IDM যাতে বারবার রিকোয়েস্ট পাঠিয়ে বাইপাস না করতে পারে।
+SESSION_DURATION = 300 
 
 # --- 🔥 LOG TO CHANNEL ---
 async def send_log(bot, text):
@@ -44,14 +46,17 @@ async def send_log(bot, text):
             )
     except Exception: pass
 
-# --- 🧹 CLEANUP LOGS (Background Task) ---
+# --- 🧹 CLEANUP LOGS ---
 async def cleanup_logs():
-    """শুধুমাত্র ১ ঘণ্টার বেশি পুরনো লগ মুছবে"""
+    """মেমোরি ক্লিয়ার করে, কিন্তু ব্লক পিরিয়ড শেষ হওয়ার পর"""
     current_time = time.time()
-    # ⚠️ TIME_LIMIT দিয়ে মুছব না, BLOCK_MEMORY দিয়ে মুছব
-    expired = [k for k, v in ACCESS_LOGS.items() if current_time - v > BLOCK_MEMORY]
+    # যারা ১০ মিনিটের বেশি সময় আগে এসেছিল, শুধু তাদের লগ মুছবে
+    expired = [k for k, v in ACCESS_LOGS.items() if current_time - v > SESSION_DURATION]
     for k in expired:
         del ACCESS_LOGS[k]
+    
+    if expired:
+        logger.info(f"🧹 Cleaned {len(expired)} expired sessions.")
 
 # --- AUTO RESTART ---
 async def auto_restart():
@@ -65,8 +70,7 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "security": "Permanent Session Check", 
-        "limit": f"{TIME_LIMIT} Seconds",
+        "security": "Strict One-Time Session", 
         "maintainer": "AnimeToki"
     })
 
@@ -75,52 +79,47 @@ async def process_request(request):
     try:
         file_id = request.match_info['file_id']
 
-        # 🛡️ STRICT RESUME LOGIC 🛡️
+        # 🛡️ IRON-CLAD SECURITY LOGIC 🛡️
         user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
         if "," in user_ip: user_ip = user_ip.split(",")[0].strip()
 
         access_key = f"{user_ip}_{file_id}"
         current_time = time.time()
 
-        # ১. Resume Check (Range Header)
+        # ডিবাগিংয়ের জন্য রেঞ্জ হেডার চেক (লজিকের জন্য নয়)
         range_header = request.headers.get("Range")
-        start_byte = 0
-        if range_header:
-            try:
-                temp = range_header.replace("bytes=", "").split("-")[0]
-                if temp.strip().isdigit(): start_byte = int(temp)
-            except: pass
         
-        is_resume = start_byte > 0
-
-        # ২. লজিক চেক
+        # --- লজিক শুরু ---
         if access_key in ACCESS_LOGS:
+            # ইউজার আগে এসেছিল। চেক করব কতক্ষণ আগে।
             start_time = ACCESS_LOGS[access_key]
             elapsed_time = current_time - start_time
             
-            # --- যদি সময় শেষ হয়ে যায় ---
+            # যদি ২ মিনিট (TIME_LIMIT) পার হয়ে যায়
             if elapsed_time > TIME_LIMIT:
-                if is_resume:
-                    # ⛔ Resume Blocked (লগ ডিলিট করব না, রেখে দেব)
-                    logger.info(f"🚫 Resume Blocked: IP={user_ip} | Byte={start_byte}")
-                    return web.Response(
-                        text=f"🚫 <b>Link Expired!</b>\nYour time limit is over.<br>You cannot resume.", 
-                        status=403, 
-                        content_type='text/html'
-                    )
-                else:
-                    # 🔄 New Start = Timer Reset
-                    logger.info(f"🔄 Timer Reset (Restart): IP={user_ip}")
-                    ACCESS_LOGS[access_key] = current_time
+                # ⛔ STRICT BLOCK: এখানে কোনো 'if is_resume' চেক নেই।
+                # সময় শেষ মানেই শেষ। IDM নতুন রিকোয়েস্ট পাঠালেও ব্লক খাবে।
+                
+                wait_time = SESSION_DURATION - elapsed_time
+                wait_msg = f"Try again in {int(wait_time/60)} mins." if wait_time > 0 else "Try again shortly."
+
+                logger.info(f"🚫 Blocked (Time Up): IP={user_ip} | Elapsed={int(elapsed_time)}s")
+                
+                return web.Response(
+                    text=f"🚫 <b>Link Expired!</b>\nYour 2-minute download window is over.<br>You cannot resume or restart immediately.<br><br><b>{wait_msg}</b>", 
+                    status=403, 
+                    content_type='text/html'
+                )
+            
+            # সময় ২ মিনিটের কম? তাহলে ডাউনলোড বা রিজিউম করতে দাও।
+            # আমরা এখানে টাইমার আপডেট করছি না! (NO RESET)
         
         else:
             # --- নতুন ইউজার ---
-            if is_resume:
-                # লগ নেই কিন্তু রিজিউম? ব্লক।
-                return web.Response(status=403, text="Invalid Session")
-            
-            # নতুন এন্ট্রি
+            # প্রথমবার এলো, তাই টাইমার সেট করলাম।
+            # এই টাইমার আর আপডেট হবে না যতক্ষণ না লগ ডিলিট হয় (১০ মিনিট পর)।
             ACCESS_LOGS[access_key] = current_time
+            logger.info(f"✅ New Session Started: IP={user_ip}")
 
         # --- DATABASE & FILE LOGIC ---
         file_data = await db.get_file(file_id)
@@ -154,14 +153,27 @@ async def process_request(request):
 
         if not src_msg: return web.Response(text="❌ File Not Found!", status=410)
 
-        # Streaming
+        # Streaming Headers to prevent caching
+        headers = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+
         try:
-            return await media_streamer(request, src_msg, custom_file_name=db_file_name)
+            # মূল স্ট্রিমিং কল
+            response = await media_streamer(request, src_msg, custom_file_name=db_file_name)
+            # রেসপন্সে নো-ক্যাশ হেডার যোগ করা (যাতে ব্রাউজার চালাকি না করে)
+            response.headers.update(headers)
+            return response
+
         except FileReferenceExpired:
             logger.warning(f"⚠️ FileRef Expired. Refreshing...")
             try:
                 refresh_msg = await working_client.get_messages(src_msg.chat.id, src_msg.id)
-                return await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
+                response = await media_streamer(request, refresh_msg, custom_file_name=db_file_name)
+                response.headers.update(headers)
+                return response
             except Exception as e:
                 logger.error(f"❌ Refresh Failed: {e}")
                 return web.Response(text="❌ Refresh Failed!", status=500)
@@ -179,7 +191,7 @@ async def watch_handler(request): return await process_request(request)
 @routes.get("/dl/{file_id}")
 async def download_handler(request): return await process_request(request)
 
-# --- 🚀 STARTUP LOGIC ---
+# --- 🚀 CLUSTER STARTUP LOGIC ---
 async def start_streamer():
     clients = []
 
@@ -234,8 +246,8 @@ async def start_streamer():
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(auto_restart, "interval", hours=4)
-    # ⚠️ Cleanup now runs every 30 mins to keep logs longer
-    scheduler.add_job(cleanup_logs, "interval", minutes=30) 
+    # Cleanup: প্রতি ১ মিনিটে চেক করবে ১০ মিনিট পুরনো লগ আছে কিনা
+    scheduler.add_job(cleanup_logs, "interval", seconds=60) 
     scheduler.start()
 
     runner = web.AppRunner(app, access_log=None)

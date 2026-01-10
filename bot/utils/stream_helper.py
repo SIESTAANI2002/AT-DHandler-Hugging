@@ -5,59 +5,12 @@ from urllib.parse import quote
 from pyrogram.types import Message
 from pyrogram.errors import FileReferenceExpired
 
+# 👇 আপনার রিকুয়েস্ট অনুযায়ী custom_dl ইমপোর্ট করা হলো
+from bot.utils.custom_dl import ByteStreamer 
+
 # Logging Setup
 logger = logging.getLogger(__name__)
 TG_CHUNK = 1024 * 1024  # 1MB Telegram Chunk Size
-
-# --- 🛠️ Custom ByteStreamer Class (Fixed) ---
-class ByteStreamer:
-    def __init__(self, client, message: Message):
-        self.client = client
-        self.message = message
-        self.media = getattr(message, message.media.value)
-        self.file_id = self.media.file_id
-
-    async def yield_chunk(self, offset=0, length=-1):
-        """
-        এই জেনারেটর ফাংশনটি ফাইল ডাউনলোড করে এবং ব্রাউজারে পাঠায়।
-        এখানেই আমরা FileReferenceExpired এরর হ্যান্ডেল করব।
-        """
-        try:
-            # পাইরোগ্রামের স্মার্ট স্ট্রিমার ব্যবহার করা হচ্ছে
-            async for chunk in self.client.stream_media(
-                message=self.message,
-                offset=offset,
-                limit=length
-            ):
-                yield chunk
-
-        except FileReferenceExpired:
-            # ⚠️ যদি মাঝপথে এরর আসে, আমরা মেসেজ রিফ্রেশ করব
-            logger.warning(f"⚠️ Stream Error: FileReferenceExpired for {self.file_id}. Refreshing...")
-            
-            try:
-                # ১. মেসেজ রিফ্রেশ (Telegram থেকে নতুন রেফারেন্স আনা)
-                refresh_msg = await self.client.get_messages(
-                    chat_id=self.message.chat.id,
-                    message_ids=self.message.id
-                )
-                
-                # ২. নতুন মেসেজ অবজেক্ট আপডেট করা
-                self.message = refresh_msg
-                self.media = getattr(refresh_msg, refresh_msg.media.value)
-
-                # ৩. আবার ডাউনলোড শুরু করা (Retry)
-                async for chunk in self.client.stream_media(
-                    message=self.message,
-                    offset=offset,
-                    limit=length
-                ):
-                    yield chunk
-                    
-            except Exception as e:
-                logger.error(f"❌ Refresh Failed inside Streamer: {e}")
-                # এখানে আর কিছু করার নেই, কানেকশন ড্রপ হবে
-                raise e
 
 # --- CORS Headers ---
 def cors_headers():
@@ -68,16 +21,48 @@ def cors_headers():
         "Access-Control-Expose-Headers": "Content-Length, Content-Range",
     }
 
-# --- 🔥 Main Media Streamer Function ---
+# --- 🔄 RETRY GENERATOR (The Magic Fix) ---
+async def yield_with_retry(client, message, file_id, chunk_index, first_part_cut, last_part_cut, part_count):
+    """
+    এই ফাংশনটি custom_dl কে কল করবে। 
+    যদি FileReferenceExpired হয়, তাহলে মেসেজ রিফ্রেশ করে আবার custom_dl কল করবে।
+    """
+    try:
+        # ১. সাধারণ চেষ্টা (Attempt 1)
+        streamer = ByteStreamer(client)
+        async for chunk in streamer.yield_file(file_id, chunk_index, first_part_cut, last_part_cut, part_count):
+            yield chunk
+
+    except FileReferenceExpired:
+        # ⚠️ এরর ধরা পড়লে
+        logger.warning(f"⚠️ FileRef Expired for {file_id}. Refreshing & Retrying...")
+        
+        try:
+            # ২. মেসেজ রিফ্রেশ করে নতুন File ID আনা
+            refresh_msg = await client.get_messages(chat_id=message.chat.id, message_ids=message.id)
+            new_media = getattr(refresh_msg, refresh_msg.media.value)
+            new_file_id = new_media.file_id # নতুন ফ্রেশ আইডি
+            
+            # ৩. আবার চেষ্টা (Attempt 2 with New ID)
+            streamer = ByteStreamer(client)
+            async for chunk in streamer.yield_file(new_file_id, chunk_index, first_part_cut, last_part_cut, part_count):
+                yield chunk
+                
+        except Exception as e:
+            logger.error(f"❌ Retry Failed: {e}")
+            raise e
+
+# --- 🔥 Main Media Streamer ---
 async def media_streamer(request, message: Message, custom_file_name=None):
     try:
         media = getattr(message, message.media.value, None)
         if not media:
             raise web.HTTPNotFound(text="Media not found")
 
+        file_id = media.file_id
         file_size = media.file_size
 
-        # --- FILENAME LOGIC ---
+        # --- FILENAME ---
         if custom_file_name:
             file_name = custom_file_name
         else:
@@ -86,31 +71,36 @@ async def media_streamer(request, message: Message, custom_file_name=None):
         encoded_file_name = quote(file_name)
         mime_type = getattr(media, "mime_type", "video/mp4") or "video/mp4"
 
-        # --- RANGE HEADER HANDLING ---
+        # --- RANGE HEADER HANDLING (Math Logic) ---
         range_header = request.headers.get("Range")
-        start = 0
-        end = file_size - 1
-        status = 200
-
         if range_header:
             try:
-                parts = range_header.replace("bytes=", "").split("-")
-                start = int(parts[0]) if parts[0] else 0
-                end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
-                status = 206 # Partial Content
+                start, end = range_header.replace("bytes=", "").split("-")
+                start = int(start)
+                end = int(end) if end else file_size - 1
+                status = 206
             except ValueError:
-                status = 200 # Fallback
+                start = 0
+                end = file_size - 1
+                status = 200
+        else:
+            start = 0
+            end = file_size - 1
+            status = 200
 
         if start >= file_size:
-            return web.Response(
-                status=416, 
-                headers={"Content-Range": f"bytes */{file_size}"}
-            )
+            return web.Response(status=416, headers={"Content-Range": f"bytes */{file_size}"})
 
-        # Length Calculation
+        # --- 🧮 OFFSET CALCULATION (OffsetInvalid Fix) ---
+        # এই ক্যালকুলেশনটি custom_dl এর জন্য খুবই জরুরি
+        offset = start - (start % TG_CHUNK) 
+        chunk_index = offset // TG_CHUNK
+        first_part_cut = start - offset
+        last_part_cut = (end % TG_CHUNK) + 1
+        part_count = math.ceil(end / TG_CHUNK) - math.floor(offset / TG_CHUNK)
+
+        # --- HEADERS ---
         content_length = end - start + 1
-
-        # --- HEADERS SETUP ---
         headers = {
             "Content-Type": mime_type,
             "Accept-Ranges": "bytes",
@@ -122,11 +112,17 @@ async def media_streamer(request, message: Message, custom_file_name=None):
         if status == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
-        # --- STREAMING START ---
-        # ⚠️ ক্লাস্টার ফিক্স: message._client ব্যবহার করছি যাতে সঠিক বট ডাউনলোড করে
-        streamer = ByteStreamer(client=message._client, message=message)
-        
-        body = streamer.yield_chunk(offset=start, length=content_length)
+        # --- START STREAMING ---
+        # আমরা সরাসরি custom_dl কল না করে আমাদের 'yield_with_retry' কল করব
+        body = yield_with_retry(
+            client=message._client, # ক্লাস্টার ক্লায়েন্ট পাস করা হচ্ছে
+            message=message,
+            file_id=file_id,
+            chunk_index=chunk_index,
+            first_part_cut=first_part_cut,
+            last_part_cut=last_part_cut,
+            part_count=part_count
+        )
 
         return web.Response(status=status, body=body, headers=headers)
 

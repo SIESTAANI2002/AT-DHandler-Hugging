@@ -65,7 +65,7 @@ routes = web.RouteTableDef()
 async def root_route_handler(request):
     return web.json_response({
         "status": "Online", 
-        "security": "Strict Resume Blocker", 
+        "security": "Session Kill Mode", 
         "limit": f"{TIME_LIMIT} Seconds",
         "maintainer": "AnimeToki"
     })
@@ -75,7 +75,7 @@ async def process_request(request):
     try:
         file_id = request.match_info['file_id']
 
-        # 🛡️ STRICT RESUME PROTECTION LOGIC 🛡️
+        # 🛡️ STRICT SESSION KILL LOGIC 🛡️
         user_ip = request.headers.get("X-Forwarded-For") or request.remote or "Unknown"
         if "," in user_ip: 
             user_ip = user_ip.split(",")[0].strip()
@@ -83,57 +83,51 @@ async def process_request(request):
         access_key = f"{user_ip}_{file_id}"
         current_time = time.time()
 
-        # ১. Resume ডিটেকশন (Byte Check Logic)
+        # ১. Resume ডিটেকশন
         range_header = request.headers.get("Range")
         start_byte = 0
-        
         if range_header:
             try:
-                # "bytes=1024-" থেকে 1024 বের করা
                 temp = range_header.replace("bytes=", "").split("-")[0]
                 if temp.strip().isdigit():
                     start_byte = int(temp)
             except:
                 start_byte = 0
         
-        # 0 এর বেশি হলে Resume, 0 হলে New Start
         is_resume = start_byte > 0
 
-        # ২. লজিক চেক (The Iron Logic)
+        # ২. লজিক চেক (Hard Expiry Check)
         if access_key in ACCESS_LOGS:
-            # --- কেইস ১: আগে থেকে লগ আছে ---
             start_time = ACCESS_LOGS[access_key]
             elapsed_time = current_time - start_time
             
-            # সময় শেষ হয়ে গেলে
+            # --- সময় শেষ হলে সেশন ডিলিট এবং ব্লক ---
             if elapsed_time > TIME_LIMIT:
-                if is_resume:
-                    # সময় শেষ + Resume = 🚫 BLOCK
-                    logger.info(f"🚫 Blocked Resume (Expired): IP={user_ip}")
-                    return web.Response(
-                        text=f"🚫 <b>Link Expired!</b>\nYour session ended {int(elapsed_time - TIME_LIMIT)}s ago.<br>Please restart the download from beginning.", 
-                        status=403, 
-                        content_type='text/html'
-                    )
-                else:
-                    # সময় শেষ + New Start = ✅ RESET & ALLOW
-                    # ইউজার আবার প্রথম থেকে শুরু করছে, তাই নতুন সেশন দিলাম
-                    logger.info(f"🔄 Timer Reset (New Start): IP={user_ip}")
-                    ACCESS_LOGS[access_key] = current_time
-
-        else:
-            # --- কেইস ২: কোনো লগ নেই (New User or Log Cleaned) ---
-            if is_resume:
-                # ⛔ লগ নেই কিন্তু Resume করতে চাইছে? = BLOCK
-                # (এর মানে ২ মিনিট আগে এসেছিলেন, লগ মুছে গেছে, এখন চালাকি করে রিজিউম করতে চাইছেন)
-                logger.info(f"🚫 Blocked Resume (No Session): IP={user_ip} | Byte={start_byte}")
+                # সেশন ডিলিট করে দিচ্ছি যাতে রিসেট না হয়
+                del ACCESS_LOGS[access_key]
+                
+                logger.info(f"🚫 Session Killed (Expired): IP={user_ip} | Elapsed={int(elapsed_time)}s")
                 return web.Response(
-                    text="🚫 <b>Access Denied!</b>\nYou cannot resume without a valid active session.<br>Please start the download from the beginning.", 
+                    text=f"🚫 <b>Link Expired!</b>\nYour session ended {int(elapsed_time - TIME_LIMIT)}s ago.<br>Please <b>Restart</b> the download from the beginning.", 
+                    status=403, 
+                    content_type='text/html'
+                )
+            
+            # সময় বাকি আছে? তাহলে চলতে থাকুক
+            
+        else:
+            # --- যদি লগ না থাকে (New User or Deleted Session) ---
+            if is_resume:
+                # লগ নেই কিন্তু Resume? -> অবশ্যই ব্লক।
+                logger.info(f"🚫 Blocked Invalid Resume: IP={user_ip} | Byte={start_byte}")
+                return web.Response(
+                    text="🚫 <b>Access Denied!</b>\nSession expired. You cannot resume.<br>Please start the download from the beginning.", 
                     status=403, 
                     content_type='text/html'
                 )
             else:
-                # লগ নেই এবং শুরু থেকে শুরু করছে = ✅ ALLOW
+                # লগ নেই এবং নতুন Start -> নতুন সেশন তৈরি
+                # logger.info(f"✅ New Session Created: IP={user_ip}")
                 ACCESS_LOGS[access_key] = current_time
 
         # --- DATABASE & FILE LOGIC ---
@@ -174,10 +168,9 @@ async def process_request(request):
         # Debug Log
         try:
             bot_name = working_client.name if working_client else "Unknown"
-            # logger.info(f"🟢 Served by: {bot_name} | IP: {user_ip}")
         except: pass
 
-        # Streaming & Retry Logic
+        # Streaming
         try:
             return await media_streamer(request, src_msg, custom_file_name=db_file_name)
         except FileReferenceExpired:
